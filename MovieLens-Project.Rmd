@@ -1,0 +1,611 @@
+---
+title: "MovieLens Project"
+author: "Iuliia Shal"
+date: "22 09 2021"
+output: 
+  html_document: 
+    df_print: kable
+    dev: png
+    toc: true
+    number_sections: true
+    theme: united
+    highlight: tango
+    fig_width: 8
+    fig_height: 5
+---
+```{r include=FALSE}
+knitr::opts_chunk$set(message = FALSE)
+Sys.setlocale("LC_ALL", "English")
+```
+\
+\
+
+```{r setup,include=FALSE}
+library(tidyverse)
+library(caret)
+library(data.table)
+library(lubridate)
+library(tidyr)
+library(textshape)
+library(scales)
+library(ggrepel)
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+# if using R 4.0 or later:
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding") # if using R 3.5 or earlier, use `set.seed(1)`
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+#   Project goal
+The aim of this project is to create a movie recommendation system based on ratings by movies and users provided for period 1995-2009.  
+We will have 2 big datasets:\
+- edx (9 ml records) - for modelling\
+- validation (1 ml records) - for testing the final model  
+\
+Below you can find the example of data composition:
+```{r data exploration, echo=FALSE}
+edx%>%sample_n(5)
+```
+\
+We can see that in *edx* dataset we have:  
+```{r unique data, echo=FALSE}
+unique_stats<-edx%>%summarize(Users=length(unique(userId)),
+                Movies=length(unique(movieId)))
+
+knitr::kable(unique_stats)
+
+rm(unique_stats)
+```
+\
+The most rated movies average ratings are:
+```{r top movies, echo=FALSE}
+most_rated<-edx%>%group_by(title)%>%
+  summarize(N_ratings=n(),Avg_rating=round(mean(rating),2))%>%arrange(desc(N_ratings))%>%
+  top_n(10,N_ratings)
+
+knitr::kable(most_rated)
+rm(most_rated)
+```
+\
+
+#   Split edx into Train and Test sets
+To build model on the edx dataset, we need to split it into *Train* and *Test* sets to avoid over fitting.  
+\
+```{r Split edx, echo=TRUE}
+set.seed(755)
+test_index <- createDataPartition(y = edx$rating, times = 1,
+                                  p = 0.2, list = FALSE)
+train_edx <- edx[-test_index,]
+test_edx <- edx[test_index,]
+
+test_edx <- test_edx %>% 
+  semi_join(train_edx, by = "movieId") %>%
+  semi_join(train_edx, by = "userId") 
+
+```
+\
+```{r RMSE,echo=FALSE}
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+```
+
+
+#   Models testing
+##   Simple Average  
+Let's start from the simple model where we estimate ratings as average movie rating.  
+
+```{r AVG model, echo=TRUE}
+mu <- mean(train_edx$rating)
+simple_average <- RMSE(test_edx$rating,mu)
+print(simple_average)
+
+```
+
+$RMSE>1$ meaning that our prediction may differ by 1 start rating. We need to improve the model and achieve $RMSE<1$.  
+\
+\
+
+##   Movie effect model  
+Let's check the distribution of movies ratings excluding Average movie rating. By doing this, we center all ratings around average.  
+
+
+```{r Distribution of movie rating, fig.align="center", echo=FALSE}
+movie_avg<-train_edx%>%group_by(movieId,title)%>%summarize(b_i=mean(rating-mu),num=n())
+movie_avg%>%ggplot(aes(b_i))+geom_histogram(bins = 20, color = "black",fill="grey")+
+  ggtitle("Histogram of Movie effect")+
+  ylab("Frequency")
+```
+
+
+We can see that there only a few movies with 5 start rating ($\mu$+1.5) and many movies equal to or below the average. We can explain it as there is a list of movies which everyone likes (blockbusters or Oscar winners) and a big tail of movies which are not that great.  $b_i$ will represent movie effect - on average how good the movie is in comparison to others.
+
+It's time to check a new model where we will include avg movie rating ($\mu$) and movie effect ($b_i$).   
+\
+```{r Movie effect prediction, echo=TRUE}
+model_with_movie_effect_prediction <- mu + test_edx%>%
+  left_join(movie_avg, by='movieId') %>%
+  pull(b_i)
+
+model_with_movie_effect_RMSE <-
+  RMSE(test_edx$rating,model_with_movie_effect_prediction)
+
+print(model_with_movie_effect_RMSE)
+```
+\
+RMSE is getting better but what about users? Do they differ from each other as well?  
+\
+\
+
+##   Movie and User effect model  
+Let's have a look how people differ from each other if we exclude avg rating and movie effect from ratings.  
+\
+\
+```{r User effect prediction, fig.align="center", echo=TRUE}
+user_avg <- train_edx%>%
+  left_join(movie_avg, by='movieId')%>%
+  group_by(userId)%>%
+  summarize(b_u = mean(rating-mu-b_i))
+
+user_avg%>%
+  ggplot(aes(b_u))+geom_histogram(bins = 30, color = "black")+
+  ggtitle("Histogram of User effect")+
+  ylab("Frequency")
+```
+\
+Users preferences are normal distributed around average and we can see a left tail of very pessimistic viewers (who tend to rate movies lower) and a right tail of very optimistic viewers (tend to like everything they watch).  We will call $b_u$ as user effect - to show the difference in viewers behaviour.
+\
+\
+Let's test a model which includes both movie and user effects:  
+\
+```{r Movie User effect model, fig.align="center", echo=TRUE}
+model_with_movie_user_effect_prediction <- mu + test_edx%>%
+  left_join(movie_avg, by='movieId') %>% pull(b_i)+test_edx%>%
+  left_join(user_avg, by='userId') %>% pull(b_u)
+
+model_with_movie_user_effect_RMSE <- 
+  RMSE(test_edx$rating,model_with_movie_user_effect_prediction)
+
+print(model_with_movie_user_effect_RMSE)
+
+```
+\
+We can see that RMSE has become significantly lower. Amazing results!  
+\
+But can we make it even better?  
+\
+Let's have a look into highest discrepancies of the model.  
+```{r residuals by num of ratings, fig.align="center", echo=FALSE}
+test_edx%>%left_join(movie_avg, by='movieId')%>%select(-title.y)%>%
+  left_join(user_avg, by='userId')%>%
+  mutate(movie_user_effect_prediction=mu+b_i+b_u)%>%
+  mutate(residual=(rating-movie_user_effect_prediction))%>%
+  group_by(title.x)%>%summarize(n_ratings=n(),avg_residual=mean(residual))%>%
+  ggplot(aes(log2(n_ratings),avg_residual))+geom_point()+ggtitle("Average residuals of movies grouped by # of Ratings")+
+  ylab("Average residuals")+
+  xlab("Log2 # of Ratings")
+```
+\
+We can see that highest discrepancies happen due to low # of ratings ($<2^5$ # of ratings). The more ratings we have, the smoother projection we can get.
+To eliminate this noise and improve RMSE we need to penalize for extreme estimates which comes from small sample sizes. We will use regularization techniques for this case.  
+\
+We are going to test set of $\lambda$ and choose the one which minimize RMSE function the best:  
+\
+```{r Regularisation, echo=TRUE}
+lambdas <- seq(0, 10, 0.1)
+
+rmses <- sapply(lambdas, function(l){
+  
+  mu <- mean(train_edx$rating)
+  
+  b_i <- train_edx %>% 
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+l)) # Movie effect  and LAMBDA
+  
+  b_u <- train_edx %>% 
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n()+l)) # User effect and LAMBDA
+  
+  predicted_ratings <- 
+    test_edx %>% 
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred = mu + b_i + b_u) %>% 
+    pull(pred)
+  
+  return(RMSE(predicted_ratings, test_edx$rating))
+})
+
+qplot(lambdas, rmses)  
+best_lambda<-lambdas[which.min(rmses)]
+```
+\
+The best $\lambda=4.9$ and we will use it as part of our regularized Movie and User effects model.  
+```{r Regularized model, echo=FALSE}
+b_i_regularized <- train_edx %>% 
+  group_by(movieId) %>%
+  summarize(b_i = sum(rating - mu)/(n()+best_lambda)) #+ Movie effect  and best LAMBDA
+
+b_u_regularized <- train_edx %>% 
+  left_join(b_i_regularized, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - b_i - mu)/(n()+best_lambda)) #+ User effect and best LAMBDA
+
+predicted_ratings <- 
+  test_edx %>% 
+  left_join(b_i_regularized, by = "movieId") %>%
+  left_join(b_u_regularized, by = "userId") %>%
+  mutate(pred = mu + b_i + b_u) %>% 
+  pull(pred)
+
+regularized_model_prediction<-RMSE(predicted_ratings, test_edx$rating)
+print(paste("RMSE: ",round(regularized_model_prediction,6)),quote = FALSE )
+```
+\
+We can see that RMSE hasn't changed much because the % ratings for not popular movies is very low in comparison the total population of ratings ($< 1\%$).  
+```{r Percent of ratings for not popular movies, echo=FALSE}
+total_ratings<-train_edx%>%summarize(n=n())%>%.$n
+
+ratings_not_popular<-train_edx %>% 
+  group_by(movieId) %>% summarize(n_ratings=n())%>%arrange(n_ratings)%>%
+  filter(n_ratings<=32)%>%summarize(not_popular=sum(n_ratings)/total_ratings)%>%.$not_popular
+
+knitr::kable(ratings_not_popular, caption = "% of ratings of Not popular movies, <= 32 ratings per movie")
+```
+\
+Even though these movies create a big clusters out of total number of movies (30%).  
+```{r Distribution of movies ratings, echo=FALSE}
+train_edx %>% 
+  group_by(movieId) %>% summarize(n_ratings=n())%>%arrange(n_ratings)%>%
+  mutate(log_n=log(n_ratings))%>%
+  ggplot(aes(log_n))+geom_histogram(aes(fill=(log_n<5)),bins=30, color = "black")+
+  scale_fill_manual(values = c("grey", "orange"))+
+  ylab("# Movies")+
+  xlab("Log2 # of Ratings")+
+  ggtitle("Distribution of Movies by # of Ratings")
+
+ratings_not_popular<-train_edx %>% 
+  group_by(movieId) %>% summarize(n_ratings=n())%>%arrange(n_ratings)%>%
+  summarize(not_popular=sum(n_ratings<=32)/n())%>%.$not_popular
+
+knitr::kable(ratings_not_popular, caption = "% of Movies with # ratings <=32")
+```
+
+The graph below will show how movie effect has been minimized for movies with low number of ratings.  
+```{r Movie user vs Regularized model, fig.align="center", echo=FALSE}
+tibble(original=movie_avg$b_i,regularized=b_i_regularized$b_i)%>%
+  ggplot(aes(original, regularized)) + 
+  geom_point(alpha=0.5)+
+  xlab("Movie effect")+
+  ylab("Regularized Movie effect")
+```
+\
+
+Now let's compare the distribution of residuals for 3 models:\
+1. Movie effect\
+2. Movie and User effects\
+3. Regularized Mode with Movie and User effect.  
+\
+```{r Residuals distribution, fig.align="center", echo=FALSE}
+residuals_movie_model<-test_edx%>%
+  left_join(movie_avg, by='movieId')%>%
+  mutate(pred=mu+b_i)%>%
+  mutate(residual_movie=rating-pred)%>%.$residual_movie
+
+residuals_movie_user_model<-test_edx%>%
+  left_join(movie_avg, by='movieId')%>%
+  left_join(user_avg, by='userId')%>%
+  mutate(pred=mu+b_i+b_u)%>%
+  mutate(residual_movie_user=rating-pred)%>%.$residual_movie_user
+
+residuals_Finalmodel<-test_edx%>%
+  left_join(b_i_regularized, by='movieId')%>%
+  left_join(b_u_regularized, by='userId')%>%
+  mutate(pred=mu+b_i+b_u)%>%mutate(pred=ifelse(pred>5,5,pred))%>% #estimation can't be more than 5
+  mutate(pred=ifelse(pred<0,0,pred))%>% #estimation can't be less than 0
+  mutate(residual_regular=rating-pred)%>%.$residual_regular
+
+res <- data.frame(Movie=residuals_movie_model,Movie_User=residuals_movie_user_model,Regularised=residuals_Finalmodel)
+res <-gather(res,model)
+ggplot(res,aes(x=value, fill=model)) + geom_density(alpha=0.35) + ggtitle("Residuals distribution of 3 models")
+```
+
+
+We can see the improvement we made by adding User effect and minor change by adding regularization.  
+Let's also understand how far we are form the normal distribution of residuals in our final model.  
+```{r QQplot of final model, fig.align="center", echo=FALSE}
+qqnorm(residuals_Finalmodel)
+qqline(residuals_Finalmodel)
+```
+\
+It's clear from the graph above that we have a big tail of overestimated ratings.  
+What else can we do to fix this problem?  
+\
+\
+
+##   Time effect  
+###   Week effect
+By putting model's residuals against the week of rating, we can observe much higher residuals for ratings made earlier 1997. It means that ratings are better than we estimate.  
+```{r Time effect, fig.align="center", echo=FALSE}
+train_edx%>%
+  left_join(b_i_regularized, by='movieId')%>%
+  left_join(b_u_regularized, by='userId')%>%
+  mutate(pred=mu+b_i+b_u)%>%
+  mutate(residual_regular=(rating-pred))%>%
+  mutate(date_rate=as_datetime(timestamp))%>%mutate(week=round_date(date_rate,"week"))%>%
+  group_by(week)%>%summarize(avg_res=mean(residual_regular))%>%
+  ggplot(aes(week,avg_res))+geom_point()+geom_smooth()+
+  scale_x_datetime(breaks = date_breaks("3 years"),labels = date_format("%Y"))+
+  xlab("Week")+
+  ylab("Average residuals")
+```
+\
+It might be one of reasons why our model overestimates other ratings. Moreover, we can see that after 1997 there is no time effect.  
+We will exclude this data from our train dataset treating it as outliers.  
+
+###   Day of the week effect  
+Do we have effect of rating per week day (Monday-Sunday?)\
+Do people like movies more when you're more relaxed on weekends?  
+\
+```{r Day of week, fig.align="center", echo=TRUE}
+train_edx %>%
+  left_join(b_i_regularized, by='movieId')%>%
+  left_join(b_u_regularized, by='userId')%>%
+  mutate(date_rate=as_datetime(timestamp))%>% mutate(week=round_date(date_rate,"week"))%>%
+  filter(week>"1997-01-01")%>%
+  mutate(day_of_week=weekdays(date_rate))%>%
+  mutate(pred = mu + b_i + b_u)%>%
+  mutate(residual_regular=rating-pred)%>%
+  ggplot(aes(x=day_of_week,y=residual_regular))+geom_boxplot()+
+  xlab("Day of week")+
+  ylab("Residuals")
+```
+\
+As per graph above, there is no difference between day of the week, meaning that there is no such effect.  
+\
+We will call a new database excluding ratings made <1997 as *train_edx_wide* and will use it in further analysis.  
+\
+```{r exclude ratings earlier 1997, echo=TRUE}
+train_edx_wide <- train_edx%>%
+  left_join(b_i_regularized, by='movieId')%>%
+  left_join(b_u_regularized, by='userId')%>%
+  mutate(date_rate=as_datetime(timestamp))%>%mutate(week=round_date(date_rate,"week"))%>%
+  filter(week>"1997-01-01")%>%
+  mutate(pred = mu + b_i + b_u)%>%
+  mutate(residual_regular=rating-pred)
+```
+\
+\
+
+##   Principal Component Analysis  
+Before we perform Principal Component Analysis (PCA), we need to have a look at movies with highest number of residuals $< -1$ (movies which we overestimates by > 1 star).  
+\
+```{r negative residuals, echo=TRUE}
+total_negative <- train_edx_wide%>%
+  filter(residual_regular<(-1))%>%summarize(n_negative=n())%>%.$n_negative
+
+train_edx_wide %>%
+  filter(residual_regular<(-1))%>%
+  group_by(movieId) %>% summarize(n_negative=n())%>%
+  arrange(desc(n_negative))%>%
+  mutate(cumul_sum = cumsum(n_negative)/total_negative)%>%
+  summarize(top_movies_50_percent = sum(cumul_sum<=0.5))
+```
+\
+By performing the code above, we can find that 533 movies have 50% of all negative residuals.  
+We will choose them to improve prediction and create PCA model.  
+\
+```{r Movies with high residuals, echo=TRUE}
+high_res_by_movie <- train_edx_wide%>%
+  filter(residual_regular<(-1))%>%
+  group_by(movieId)%>%
+  summarize(n_negative=n())%>%
+  top_n(533,n_negative)%>%
+  .$movieId
+```
+\
+We will also choose Users who rated $>= 20$ movies, we assume that this number is enough to understand their preferences.
+\
+```{r PCA model, fig.align="center", echo = TRUE}
+x <- train_edx_wide %>% 
+  filter(movieId %in% high_res_by_movie) %>%
+  group_by(userId) %>%
+  filter(n() >= 20) %>%
+  ungroup() %>% 
+  select(title, userId, rating) %>%
+  pivot_wider(names_from = "title", values_from = "rating") %>%
+  as.matrix()
+
+rownames(x)<- x[,1]
+x <- x[,-1]
+
+x <- sweep(x, 2, colMeans(x, na.rm = TRUE)) #Exclude Movie effect
+x <- sweep(x, 1, rowMeans(x, na.rm = TRUE)) #Exclude User effect
+
+x[is.na(x)] <- 0
+pca <- prcomp(x)
+
+```
+\
+
+Looking at Principal Component 1 (PC1) and Principal Component 2 (PC2), we can clearly say that PC1 explains differences between people who like Blockbusters (Armageddon, Independence Day) vs those who prefer Independent/Art movies (Pulp Fiction, Clockwork Orange). PC2 shows difference between movies for the whole family (Toy Story) vs movies for adults (Fight Club).  
+\
+```{r PC1 vs PC2,  fig.align="center",message = FALSE,echo=FALSE}
+pcs_matrix<-data.frame(pca$rotation, title=colnames(x))
+
+ggplot(pcs_matrix,aes(PC1,PC2))+
+geom_point(cex=3, pch=21) +
+coord_fixed(ratio = 1)+
+geom_label_repel(data=pcs_matrix%>%filter(PC2<(-0.12) | PC2>0.12 | PC1 >0.12 | PC1<(-0.12)),
+                 aes(label=substr(title,0,21)),
+                 box.padding = 0.5, max.overlaps = 10)
+
+```
+\
+Meanwhile PC3 separates Nerd/Sci-Fi movies from others and PC4 - Oscar movies (tough ones) from Comedy movies.
+\
+```{r PC3 vs PC4,  fig.align="center",message = FALSE, echo=FALSE}
+ggplot(pcs_matrix,aes(PC3,PC4))+
+geom_point(cex=3, pch=21) +
+coord_fixed(ratio = 1)+
+geom_label_repel(data=pcs_matrix%>%filter(PC3 <(-0.15) | PC4>(0.1)| PC4<(-0.05)),aes(label=substr(title,0,21)),
+                 box.padding = 0.5, max.overlaps = 10)
+```
+\
+By plotting the importance of each Principal Component (PC), we can see that around 150 PCs can explain 50% of residuals fluctuations.  
+\
+```{r Importance plot, echo=FALSE}
+plot(summary(pca)$importance[3,])
+```
+\
+It's quite a high number of components to add to our model.  
+Let's check how RMSE improves when we add every 10 PCs to the model (starting with 2 PCs).  
+\
+```{r Choose number of PCs,  fig.align="center",echo=FALSE}
+PC_n<-seq(2, 150, 10)
+
+rmses_pca <- sapply(PC_n, function(p){
+  
+  p_q_matrix<-pca$x[,1:p]%*%t(pca$rotation[,1:p])
+  colnames(p_q_matrix)<-rownames(pca$rotation)
+  
+  p_q_matrix<-tidy_matrix(p_q_matrix, row.name ="userId", col.name = "title",value.name="residual_estimate")
+  p_q_matrix$userId<-as.integer(p_q_matrix$userId)
+  
+  prediction_PCA<-test_edx%>%
+    left_join(b_i_regularized, by='movieId')%>%
+    left_join(b_u_regularized, by='userId')%>%
+    left_join(p_q_matrix, by=c('userId','title'))%>%
+    mutate(residual_estimate=replace(residual_estimate,is.na(residual_estimate),0))%>%
+    mutate(pred=mu+b_i+b_u+residual_estimate)%>%.$pred
+  
+  return(RMSE(prediction_PCA, test_edx$rating))
+  
+})
+
+qplot(PC_n, rmses_pca,label=round(rmses_pca,3),geom=c("point", "text"),vjust=2)+
+  labs(x="PC number",y="RMSE of PCA model")+ylim(0.849,0.862)
+
+```
+\
+From the graph above we can find that RMSE is minimal when we use 32 principal components.  
+
+```{r best PC number, echo=TRUE}
+best_PC_number <- PC_n[which.min(rmses_pca)]
+print(best_PC_number)
+```
+\
+We are going to use these 32 principal components for our model which are expected to improve the model by extra 0.01.  
+With code below we calculate $p*q$ matrix of estimated residuals.
+\
+```{r pq matrix, echo=TRUE}
+p<-32
+
+p_q_matrix <- pca$x[,1:p]%*%t(pca$rotation[,1:p])
+colnames(p_q_matrix) <- rownames(pca$rotation)
+
+p_q_matrix <- tidy_matrix(p_q_matrix, row.name ="userId", col.name = "title",
+                        value.name="residual_estimate")
+p_q_matrix$userId <- as.integer(p_q_matrix$userId)
+
+```
+\
+And our new model will look like:  
+$$Y_{u,i} = \mu+b_i+b_u+p_{u,1}*q_{1,i}+...+p_{u,32}*q_{32,i}+e_{u,i}$$
+where *u*-user, *i*-movie.  
+\
+The residuals distribution of the new PCA model has improved on the *test_edx* dataset:  
+```{r PCA residuals,  fig.align="center",echo=FALSE}
+residuals_PCA<-test_edx%>%
+  left_join(b_i_regularized, by='movieId')%>%
+  left_join(b_u_regularized, by='userId')%>%
+  left_join(p_q_matrix, by=c('userId','title'))%>%
+  mutate(residual_estimate=replace(residual_estimate,is.na(residual_estimate),0))%>%
+  mutate(pred=mu+b_i+b_u+residual_estimate)%>%
+  mutate(if_else(pred>5,5,if_else(pred<0,0,pred)))%>% #Forecast can't be >5 or <0
+  mutate(residual_PCA=rating-pred)%>%.$residual_PCA
+
+res <- data.frame(Movie=residuals_movie_model,Movie_User_Reg=residuals_Finalmodel,PCA=residuals_PCA)
+res <-gather(res,model)
+ggplot(res,aes(x=value, fill=model)) + geom_density(alpha=0.35)
+```
+\
+And RMSE of the final PCA model will be:  
+```{r PCA prediction, echo=TRUE}
+prediction_PCA <- test_edx%>%
+  left_join(b_i_regularized, by='movieId')%>%
+  left_join(b_u_regularized, by='userId')%>%
+  left_join(p_q_matrix, by=c('userId','title'))%>%
+  mutate(residual_estimate = replace(residual_estimate,is.na(residual_estimate),0))%>%
+  mutate(pred = mu+b_i+b_u+residual_estimate)%>%
+  mutate(if_else(pred>5,5,if_else(pred<0,0,pred)))%>% #Forecast can't be >5 or <0
+  .$pred
+
+prediction_PCA_RMSE<-RMSE(prediction_PCA, test_edx$rating)
+print(prediction_PCA_RMSE) 
+```
+\
+\
+Prediction has been improved slightly, but still better than regularized model.
+```{r compare all models, echo=TRUE}
+models <- t(data.frame(Simple_Avg = simple_average,
+                     Movie_effect = model_with_movie_effect_RMSE,
+                     Movie_User_effect = model_with_movie_user_effect_RMSE,
+                     Regularized = regularized_model_prediction,
+                     PCA = prediction_PCA_RMSE))
+colnames(models)<-"RMSE"
+knitr::kable(models, caption = "Models comparison by RMSE")
+
+```
+\
+We have found our best model ! Principal component model (PCA) !  
+
+# Final model application  
+
+Now we are ready to apply our PCA model to the *Validation* dataset to see how well it predicts Movie ratings.  
+\
+```{r Validation dataset prediction, echo=TRUE}
+prediction_Final<-validation%>%
+  left_join(b_i_regularized, by='movieId')%>%
+  left_join(b_u_regularized, by='userId')%>%
+  left_join(p_q_matrix, by=c('userId','title'))%>%
+  mutate(residual_estimate=replace(residual_estimate,is.na(residual_estimate),0),
+         b_i=replace(b_i,is.na(b_i),0),
+         b_u=replace(b_u,is.na(b_u),0))%>%
+  mutate(pred=mu+b_i+b_u+residual_estimate)%>%.$pred
+
+prediction_Final_RMSE<-RMSE(prediction_Final,validation$rating)
+print(prediction_Final_RMSE)
+```
+\
+$RMSE=0.8496$ is a great improvement vs the model with Simple average and even Movie/User effects.  
